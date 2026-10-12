@@ -1,0 +1,5 @@
+vosk
+sounddevice
+paho-mqtt>=2.0
+numpy
+samplerate
