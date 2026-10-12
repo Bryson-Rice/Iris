@@ -71,7 +71,7 @@ Iris doesn't use MQTT passwords or TLS, so keep the broker on your home network.
 **Install Iris.** Clone or download this repository onto the server machine, then:
 
 ```bash
-cd iris-home/server
+cd iris/server
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
@@ -114,8 +114,8 @@ Wants=network-online.target
 
 [Service]
 User=iris
-WorkingDirectory=/opt/iris-home/server
-ExecStart=/opt/iris-home/server/.venv/bin/python main.py
+WorkingDirectory=/opt/iris/server
+ExecStart=/opt/iris/server/.venv/bin/python main.py
 Restart=on-failure
 
 [Install]
