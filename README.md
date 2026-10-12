@@ -1,6 +1,6 @@
 # Iris
 
-A self-hosted voice assistant for the smart homes. Raspberry Pi satellites in each room listen for a wake word and transcribe commands locally; a central server works out what was meant and drives Home Assistant. No audio ever leaves the house.
+A self-hosted voice assistant for smart homes. Raspberry Pi satellites in each room listen for a wake word and transcribe commands locally; a central server works out what was meant and drives Home Assistant. No audio ever leaves the house.
 
 
 ## How a command flows
