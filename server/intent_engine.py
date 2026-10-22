@@ -1,6 +1,7 @@
 import logging
 import re
 from dataclasses import dataclass, field
+from datetime import datetime
 
 from config import COLORS_RGB, ROOMS
 from context_manager import ContextManager
@@ -87,11 +88,14 @@ ACTION_RULES: list[ActionRule] = [
         "what's the temp", "what is the temp", "whats the temp",
         "current temperature", "temperature outside", "temperature right now", "temperature now",
         "how hot is it", "how cold is it", "how warm is it",
+        "what will the temperature be", "what will the temp be",
+        "how hot will it be", "how cold will it be", "how warm will it be",
     ]),
     ActionRule("weather_today", phrases=[
         "what's the weather", "what is the weather", "how's the weather", "hows the weather",
         "whats the weather", "how is the weather", "what will the weather be",
         "weather today", "weather forecast", "will it rain", "is it going to rain",
+        "weather at", "weather tonight", "weather this",
     ]),
     ActionRule("weather_riding", phrases=[
         "good riding weather", "good motorcycle weather", "good day to ride",
@@ -149,6 +153,99 @@ CITY_PATTERN = re.compile(
     r"\b(?:in|for|at)\s+([A-Za-z\s\[\]]+?)(?:\s+today|\s+tomorrow|\s+right now|\s+now|\s+outside|$)"
 )
 
+# Vosk tends to transcribe times as words ("two p m"), so digits and words are both handled.
+_HOUR_WORDS = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+}
+_MINUTE_WORDS = {"fifteen": 15, "thirty": 30, "forty five": 45}
+_HOUR_TOKEN = "|".join([r"\d{1,2}", *sorted(_HOUR_WORDS, key=len, reverse=True)])
+_MINUTE_TOKEN = r"\d{2}|fifteen|thirty|forty[\s-]five"
+_MERIDIEM = r"[ap]\.?\s?m\.?"
+
+# "2pm", "2:30 p.m.", "two thirty p m", "at 2 o'clock"
+_TIME_WITH_MERIDIEM = re.compile(
+    rf"\b(?:(?:at|around)\s+)?({_HOUR_TOKEN})(?:(?::|\s+)({_MINUTE_TOKEN}))?"
+    rf"\s*({_MERIDIEM}|o'?\s?clock)(?![a-z])"
+)
+# "at 14:00", "at 2:30", "at two". The "at" is required so stray numbers aren't read as times.
+_TIME_BARE = re.compile(
+    rf"\b(?:at|around)\s+({_HOUR_TOKEN})(?:(?::|\s+)({_MINUTE_TOKEN}))?(?![\w:])"
+)
+_NOON_MIDNIGHT = re.compile(r"\b(?:at\s+)?(noon|midnight)\b")
+# (?<!good\s) keeps the greeting "good morning, what's the weather" from meaning 9 AM.
+_PERIOD = re.compile(r"(?<!good\s)\b(?:(this)\s+)?(morning|afternoon|evening|tonight)\b")
+_PERIOD_HOURS = {"morning": 9, "afternoon": 15, "evening": 18, "tonight": 21}
+
+
+def _hour_number(token: str) -> int:
+    return int(token) if token.isdigit() else _HOUR_WORDS[token]
+
+
+def _minute_number(token: str | None) -> int:
+    if not token:
+        return 0
+    if token.isdigit():
+        return min(int(token), 59)
+    return _MINUTE_WORDS[re.sub(r"[\s-]+", " ", token)]
+
+
+def _next_hour_occurrence(hour: int, now: datetime) -> int:
+    base = hour % 12
+    for candidate in (base, base + 12):
+        if candidate >= now.hour:
+            return candidate
+    return base if 6 <= base <= 11 else base + 12
+
+
+def _extract_time(text: str, now: datetime | None = None) -> tuple[dict | None, str]:
+    now = now or datetime.now()
+
+    day_offset = None
+    if re.search(r"\btomorrow\b", text):
+        day_offset = 1
+    elif re.search(r"\btoday\b", text):
+        day_offset = 0
+
+    period = _PERIOD.search(text)
+    if period and day_offset is None and (period.group(1) or period.group(2) == "tonight"):
+        day_offset = 0
+
+    hour = minute = None
+    spans = [period.span()] if period else []
+
+    if match := _TIME_WITH_MERIDIEM.search(text):
+        hour, minute = _hour_number(match.group(1)), _minute_number(match.group(2))
+        marker = match.group(3)
+        if marker[0] in "ap":
+            if hour <= 12:
+                hour = hour % 12 + (12 if marker[0] == "p" else 0)
+        else:  # o'clock
+            hour = _next_hour_occurrence(hour, now)
+        spans.append(match.span())
+    elif match := _TIME_BARE.search(text):
+        hour, minute = _hour_number(match.group(1)), _minute_number(match.group(2))
+        if 1 <= hour <= 12:
+            hour = _next_hour_occurrence(hour, now)
+        spans.append(match.span())
+
+    if hour is None and (match := _NOON_MIDNIGHT.search(text)):
+        hour, minute = (12 if match.group(1) == "noon" else 0), 0
+        spans.append(match.span())
+
+    if hour is None and period:
+        hour, minute = _PERIOD_HOURS[period.group(2)], 0
+
+    if hour is None or hour > 23:
+        return None, text
+
+    remaining = text
+    for start, end in sorted(spans, reverse=True):
+        remaining = remaining[:start] + " " + remaining[end:]
+
+    return {"hour": hour, "minute": minute, "day_offset": day_offset}, remaining.strip()
+
+
 ROOM_WIDE_SIGNALS = ("all", "every", "the lights", "the lamps", "the bulbs", "the fans", "the switches")
 ACTION_NOISE = (
     "turn on", "turn off", "switch on", "switch off", "power on", "power off",
@@ -195,7 +292,6 @@ _KELVIN_HUNDREDS = re.compile(
 
 
 def _spoken_number(words: list[str]) -> int | None:
-    """'twenty seven' -> 27, 'sixty five' -> 65, 'six five' -> 65, 'nineteen' -> 19."""
     if len(words) == 1:
         return WORD_TO_NUM.get(words[0])
     if len(words) == 2:
@@ -233,8 +329,6 @@ def _extract_kelvin(text: str) -> int | None:
 
 
 class IntentEngine:
-    """Turns recognised speech into an intent dict: room, device, action,
-    target_name, parameters, raw, confidence."""
 
     def __init__(self, context: ContextManager):
         self.context = context
@@ -301,8 +395,6 @@ class IntentEngine:
         return ROOM_ALIASES.get(default_room, default_room)
 
     def _extract_target_name(self, text: str, device_type: str | None) -> str | None:
-        """Name of the one specific device being addressed ("tv light"), or None
-        when the command covers everything of that type in the room."""
         if device_type is None:
             return None
 
@@ -345,7 +437,11 @@ class IntentEngine:
                 params["temperature"] = int(match.group(1))
 
         if action in ("weather_today", "weather_riding", "weather_temperature"):
-            match = CITY_PATTERN.search(text)
+            when, city_text = _extract_time(text)
+            if when:
+                params["when"] = when
+
+            match = CITY_PATTERN.search(city_text)
             if match:
                 city = match.group(1).strip()
                 if city.lower() not in ("the", "a", "my", "here"):

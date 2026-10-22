@@ -1,5 +1,5 @@
 import logging
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import requests
 
@@ -36,19 +36,24 @@ WMO_CONDITIONS = {
 
 WEATHER_UNAVAILABLE = "Sorry, I couldn't reach the weather service right now."
 TEMPERATURE_UNAVAILABLE = "Sorry, I couldn't get the current temperature right now."
+TIME_UNAVAILABLE = "Sorry, I only have the forecast through tomorrow."
 
 
 class WeatherEngine:
-    def daily_forecast(self, city: str | None = None) -> str:
+    def daily_forecast(self, city: str | None = None, when: dict | None = None) -> str:
         data, name = self._load(city)
         if data is None:
             return WEATHER_UNAVAILABLE
+        if when:
+            return self._format_forecast_at(data, name, when)
         return self._format_daily(data, name)
 
-    def current_temperature(self, city: str | None = None) -> str:
+    def current_temperature(self, city: str | None = None, when: dict | None = None) -> str:
         data, name = self._load(city)
         if data is None:
             return WEATHER_UNAVAILABLE
+        if when:
+            return self._format_temperature_at(data, name, when)
 
         reading = _current_reading(data)
         if reading is None:
@@ -123,8 +128,8 @@ class WeatherEngine:
                     "latitude":  lat,
                     "longitude": lon,
                     "hourly": ",".join([
-                        "temperature_2m", "precipitation_probability", "precipitation",
-                        "windspeed_10m", "weathercode",
+                        "temperature_2m", "apparent_temperature", "precipitation_probability",
+                        "precipitation", "windspeed_10m", "weathercode",
                     ]),
                     "daily": ",".join([
                         "temperature_2m_max", "temperature_2m_min", "precipitation_sum",
@@ -145,6 +150,64 @@ class WeatherEngine:
         except Exception as e:
             logger.error(f"Weather fetch failed: {e}")
             return None
+
+    def _hour_snapshot(self, data: dict, when: dict) -> dict | None:
+        hourly = data.get("hourly", {})
+        slot = _locate_hour(hourly, when)
+        if slot is None:
+            return None
+        index, target, now = slot
+
+        temp = _hourly_value(hourly, "temperature_2m", index)
+        if temp is None:
+            return None
+        feels_like = _hourly_value(hourly, "apparent_temperature", index)
+
+        return {
+            "label":      _slot_label(target, now),
+            "tense":      _tense(target, now),
+            "temp":       round(temp),
+            "feels_like": round(temp if feels_like is None else feels_like),
+            "code":       _hourly_value(hourly, "weathercode", index),
+            "rain_pct":   _hourly_value(hourly, "precipitation_probability", index) or 0,
+            "wind":       round(_hourly_value(hourly, "windspeed_10m", index) or 0),
+        }
+
+    def _format_temperature_at(self, data: dict, city: str, when: dict) -> str:
+        snap = self._hour_snapshot(data, when)
+        if snap is None:
+            return TIME_UNAVAILABLE
+
+        lead = {"past": "It was", "present": "It's", "future": "It'll be"}[snap["tense"]]
+        message = f"{lead} {snap['temp']}° in {city} at {snap['label']}"
+        if abs(snap["feels_like"] - snap["temp"]) >= FEELS_LIKE_MIN_DIFF_F:
+            message += f", with a feels-like of {snap['feels_like']}°"
+        return message + "."
+
+    def _format_forecast_at(self, data: dict, city: str, when: dict) -> str:
+        snap = self._hour_snapshot(data, when)
+        if snap is None:
+            return TIME_UNAVAILABLE
+
+        parts = [f"At {snap['label']} in {city}:"]
+        parts.append(WMO_CONDITIONS.get(snap["code"], "Mixed conditions") + ".")
+
+        temp = f"{snap['temp']}°"
+        if abs(snap["feels_like"] - snap["temp"]) >= FEELS_LIKE_MIN_DIFF_F:
+            temp += f", feels like {snap['feels_like']}°"
+        parts.append(temp + ".")
+
+        if snap["rain_pct"] >= 70:
+            parts.append(f"Expect rain — {snap['rain_pct']}% chance.")
+        elif snap["rain_pct"] >= 30:
+            parts.append(f"There's a {snap['rain_pct']}% chance of rain.")
+
+        if snap["wind"] >= RIDING_WIND_DANGER_MPH:
+            parts.append(f"Very windy — {snap['wind']} mph winds.")
+        elif snap["wind"] >= RIDING_WIND_THRESHOLD_MPH:
+            parts.append(f"Winds around {snap['wind']} mph.")
+
+        return " ".join(parts)
 
     def _format_daily(self, data: dict, city: str) -> str:
         daily = data.get("daily", {})
@@ -320,7 +383,7 @@ class WeatherEngine:
 
 
 def _current_reading(data: dict) -> tuple[int, int] | None:
-    """(temperature, feels-like) right now, or None if the API didn't return them."""
+    # temperature, feels-like right now, or None if the API didn't return them
     current = data.get("current") or {}
     temp = current.get("temperature_2m")
     if temp is None:
@@ -334,6 +397,46 @@ def _current_condition(data: dict) -> str | None:
     if code is None:
         return None
     return WMO_CONDITIONS.get(code, "Mixed conditions")
+
+
+def _target_slot(when: dict, now: datetime) -> datetime:
+    hour = when["hour"] + (1 if when.get("minute", 0) >= 30 else 0)  # nearest hour
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    target = midnight + timedelta(hours=hour)
+
+    day_offset = when.get("day_offset")
+    if day_offset is None:
+        this_hour = now.replace(minute=0, second=0, microsecond=0)
+        day_offset = 1 if target < this_hour else 0
+    return target + timedelta(days=day_offset)
+
+
+def _locate_hour(hourly: dict, when: dict, now: datetime | None = None):
+    # (index into the hourly arrays, target slot, now), or None if it isn't in the forecast
+    now = now or datetime.now()
+    target = _target_slot(when, now)
+    try:
+        index = hourly.get("time", []).index(target.strftime("%Y-%m-%dT%H:00"))
+    except ValueError:
+        return None
+    return index, target, now
+
+
+def _hourly_value(hourly: dict, key: str, index: int):
+    values = hourly.get(key) or []
+    return values[index] if index < len(values) else None
+
+
+def _tense(target: datetime, now: datetime) -> str:
+    this_hour = now.replace(minute=0, second=0, microsecond=0)
+    if target < this_hour:
+        return "past"
+    return "present" if target == this_hour else "future"
+
+
+def _slot_label(target: datetime, now: datetime) -> str:
+    label = target.strftime("%-I %p")
+    return label if target.date() == now.date() else f"{label} tomorrow"
 
 
 def _fmt_hour(iso: str) -> str:

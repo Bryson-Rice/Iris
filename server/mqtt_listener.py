@@ -143,7 +143,9 @@ class MQTTListener:
 
         intent = self.intent_engine.parse(text, room)
         action = intent.get("action")
-        city = intent.get("parameters", {}).get("city")
+        params = intent.get("parameters", {})
+        city = params.get("city")
+        when = params.get("when")
 
         # The satellite's vocabulary is closed; a city it didn't recognise arrives as [unk].
         if city and "[unk]" in city:
@@ -152,9 +154,9 @@ class MQTTListener:
         if action == "tell_time":
             return spoken_time()
         if action == "weather_temperature":
-            return self.weather_engine.current_temperature(city)
+            return self.weather_engine.current_temperature(city, when)
         if action == "weather_today":
-            return self.weather_engine.daily_forecast(city)
+            return self.weather_engine.daily_forecast(city, when)
         if action == "weather_riding":
             return self.weather_engine.riding_assessment(city)
         if action == "timer_set":
